@@ -1311,8 +1311,9 @@ impl<'a, 'b> Folder for InvocationCollector<'a, 'b> {
     }
 
     fn fold_block(&mut self, block: P<Block>) -> P<Block> {
-        let old_directory_ownership = self.cx.current_expansion.directory_ownership;
-        self.cx.current_expansion.directory_ownership = DirectoryOwnership::UnownedViaBlock;
+        let old_directory_ownership =
+            mem::replace(&mut self.cx.current_expansion.directory_ownership,
+                         DirectoryOwnership::UnownedViaBlock);
         let result = noop_fold_block(block, self);
         self.cx.current_expansion.directory_ownership = old_directory_ownership;
         result
@@ -1346,7 +1347,13 @@ impl<'a, 'b> Folder for InvocationCollector<'a, 'b> {
                     return noop_fold_item(item, self);
                 }
 
-                let orig_directory_ownership = self.cx.current_expansion.directory_ownership;
+                // If the directory ownership is replaced, this var
+                // holds the original so that it can be swapped back in.
+                let mut orig_directory_ownership = None;
+                // If the directory ownership `relative` field was appended to,
+                // this bool is `true` so that it can be popped at the end.
+                let mut directory_ownership_needs_pop = false;
+
                 let mut module = (*self.cx.current_expansion.module).clone();
                 module.mod_path.push(item.ident);
 
@@ -1356,12 +1363,11 @@ impl<'a, 'b> Folder for InvocationCollector<'a, 'b> {
                 let inline_module = item.span.contains(inner) || inner.is_dummy();
 
                 if inline_module {
-                    if let Some(path) = attr::first_attr_value_str_by_name(&item.attrs, "path") {
-                        self.cx.current_expansion.directory_ownership =
-                            DirectoryOwnership::Owned { relative: None };
-                        module.directory.push(&*path.as_str());
-                    } else {
-                        module.directory.push(&*item.ident.as_str());
+                    if let DirectoryOwnership::Owned { relative } =
+                        &mut self.cx.current_expansion.directory_ownership
+                    {
+                        relative.push(item.ident);
+                        directory_ownership_needs_pop = true;
                     }
                 } else {
                     let path = self.cx.parse_sess.source_map().span_to_unmapped_path(inner);
@@ -1370,22 +1376,37 @@ impl<'a, 'b> Folder for InvocationCollector<'a, 'b> {
                         other => PathBuf::from(other.to_string()),
                     };
                     let directory_ownership = match path.file_name().unwrap().to_str() {
-                        Some("mod.rs") => DirectoryOwnership::Owned { relative: None },
+                        Some("mod.rs") => DirectoryOwnership::Owned { relative: vec![] },
                         Some(_) => DirectoryOwnership::Owned {
-                            relative: Some(item.ident),
+                            relative: vec![item.ident],
                         },
                         None => DirectoryOwnership::UnownedViaMod(false),
                     };
                     path.pop();
                     module.directory = path;
-                    self.cx.current_expansion.directory_ownership = directory_ownership;
+                    orig_directory_ownership =
+                        Some(mem::replace(
+                            &mut self.cx.current_expansion.directory_ownership,
+                            directory_ownership));
                 }
 
                 let orig_module =
                     mem::replace(&mut self.cx.current_expansion.module, Rc::new(module));
+
                 let result = noop_fold_item(item, self);
+
+                // Clean up, restoring all replaced or mutated expansion state.
                 self.cx.current_expansion.module = orig_module;
-                self.cx.current_expansion.directory_ownership = orig_directory_ownership;
+                if let Some(orig_directory_ownership) = orig_directory_ownership {
+                    self.cx.current_expansion.directory_ownership = orig_directory_ownership;
+                }
+                if directory_ownership_needs_pop {
+                    if let DirectoryOwnership::Owned { relative } =
+                        &mut self.cx.current_expansion.directory_ownership
+                    {
+                        relative.pop();
+                    }
+                }
                 result
             }
 
